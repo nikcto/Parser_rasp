@@ -51,9 +51,18 @@ async def root():
     }
 
 
-@app.get("/health", tags=["Общее"])
-async def health():
-    return {"status": "ok"}
+@app.get("/api/debug", tags=["Общее"])
+async def debug_call():
+    client = await rusoil.get_client()
+    try:
+        resp = await client.post("/get_prepod", json={"id_fak": 0, "search": "Попов"})
+        return {
+            "status": resp.status_code,
+            "headers": dict(resp.headers),
+            "text": resp.text[:1000]
+        }
+    except Exception as e:
+        return {"exception": str(e)}
 
 
 @app.get("/api/now", tags=["Общее"], summary="Текущая учебная неделя и статус")
