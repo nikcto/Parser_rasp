@@ -9,7 +9,7 @@ from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from client import RusoilClient
+from client import RusoilClient, clean_fio
 
 # Кэш: результаты поиска храним 1 час, расписание 30 минут
 search_cache = TTLCache(maxsize=1000, ttl=3600)
@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="USPTU Schedule API & Proxy",
     description="Проксирующий REST API для официального расписания УГНТУ (raspisanie.rusoil.net)",
-    version="1.0.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -46,23 +46,38 @@ async def root():
     return {
         "status": "online",
         "service": "USPTU Schedule Proxy API",
+        "version": "1.2.0",
         "docs": "/docs",
         "upstream": "https://raspisanie.rusoil.net",
     }
 
 
-@app.get("/api/debug", tags=["Общее"])
-async def debug_call():
+@app.get("/health", tags=["Общее"])
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/api/debug", tags=["Диагностика"])
+async def debug_test(q: str = "по"):
+    """Тестовый вызов к raspisanie.rusoil.net для проверки ответа официального сервера"""
     client = await rusoil.get_client()
+    form_data = {"id_fak": "0", "search": q}
     try:
-        resp = await client.post("/get_prepod", json={"id_fak": 0, "search": "Попов"})
+        resp = await client.post("/get_prepod", data=form_data)
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
         return {
             "status": resp.status_code,
             "headers": dict(resp.headers),
-            "text": resp.text[:1000]
+            "parsed_type": type(parsed).__name__,
+            "prepods_count": len(parsed.get("prepods", [])) if isinstance(parsed, dict) else 0,
+            "sample": parsed.get("prepods", [])[:3] if isinstance(parsed, dict) else parsed,
+            "raw_preview": resp.text[:400]
         }
     except Exception as e:
-        return {"exception": str(e)}
+        return {"error": str(e)}
 
 
 @app.get("/api/now", tags=["Общее"], summary="Текущая учебная неделя и статус")
@@ -80,20 +95,21 @@ async def global_search(
     q: str = Query(..., min_length=2, description="Поисковый запрос (например: 'Попов', 'БЦШ', '432')")
 ):
     """Параллельно ищет в базе преподавателей, групп и аудиторий"""
-    cache_key = f"global_search_{q.strip().lower()}"
+    query_clean = q.strip()
+    cache_key = f"global_search_{query_clean.lower()}"
     if cache_key in search_cache:
         return search_cache[cache_key]
 
-    prepods_task = rusoil.search_prepod(q)
-    groups_task = rusoil.search_groups(q)
-    auditors_task = rusoil.search_auditors(q)
+    prepods_task = rusoil.search_prepod(query_clean)
+    groups_task = rusoil.search_groups(query_clean)
+    auditors_task = rusoil.search_auditors(query_clean)
 
     prepods, groups, auditors = await asyncio.gather(
         prepods_task, groups_task, auditors_task, return_exceptions=True
     )
 
     result = {
-        "query": q,
+        "query": query_clean,
         "prepods": prepods if isinstance(prepods, list) else [],
         "groups": groups if isinstance(groups, list) else [],
         "auditors": auditors if isinstance(auditors, list) else [],
@@ -103,34 +119,40 @@ async def global_search(
 
 
 @app.get("/api/prepods/search", tags=["Преподаватели"], summary="Поиск преподавателей по ФИО")
+@app.get("/api/prepod/search", tags=["Преподаватели"], include_in_schema=False)
 async def search_prepods(q: str = Query(..., min_length=2, description="ФИО или часть")):
-    cache_key = f"prepod_search_{q.strip().lower()}"
+    query_clean = q.strip()
+    cache_key = f"prepod_search_{query_clean.lower()}"
     if cache_key in search_cache:
         return search_cache[cache_key]
 
-    results = await rusoil.search_prepod(q)
+    results = await rusoil.search_prepod(query_clean)
     search_cache[cache_key] = results
     return results
 
 
 @app.get("/api/groups/search", tags=["Группы"], summary="Поиск групп по шифру")
+@app.get("/api/group/search", tags=["Группы"], include_in_schema=False)
 async def search_groups(q: str = Query(..., min_length=2, description="Шифр группы (например: БЦШ02)")):
-    cache_key = f"group_search_{q.strip().lower()}"
+    query_clean = q.strip()
+    cache_key = f"group_search_{query_clean.lower()}"
     if cache_key in search_cache:
         return search_cache[cache_key]
 
-    results = await rusoil.search_groups(q)
+    results = await rusoil.search_groups(query_clean)
     search_cache[cache_key] = results
     return results
 
 
 @app.get("/api/auditors/search", tags=["Аудитории"], summary="Поиск аудиторий")
+@app.get("/api/auditor/search", tags=["Аудитории"], include_in_schema=False)
 async def search_auditors(q: str = Query(..., min_length=1, description="Номер аудитории или корпус")):
-    cache_key = f"auditor_search_{q.strip().lower()}"
+    query_clean = q.strip()
+    cache_key = f"auditor_search_{query_clean.lower()}"
     if cache_key in search_cache:
         return search_cache[cache_key]
 
-    results = await rusoil.search_auditors(q)
+    results = await rusoil.search_auditors(query_clean)
     search_cache[cache_key] = results
     return results
 
@@ -154,20 +176,51 @@ async def get_prepod_schedule(
 
 @app.get("/api/prepod/by-name", tags=["Преподаватели"], summary="Быстрый поиск расписания преподавателя по имени")
 async def get_prepod_schedule_by_name(
-    name: str = Query(..., description="ФИО преподавателя (например: 'Попов Денис')"),
+    name: str = Query(..., description="ФИО преподавателя (например: 'Попов Денис Владимирович')"),
     week: int = Query(10, ge=1, le=30, description="Номер недели"),
 ):
-    """Удобный эндпоинт в один шаг: ищет преподавателя по имени и сразу возвращает его расписание"""
-    prepods = await rusoil.search_prepod(name)
+    """
+    Умный поиск расписания преподавателя:
+    1. Ищет по фамилии (первое слово) на официальном сервере
+    2. Сопоставляет полное ФИО независимо от точек и опечаток
+    3. Загружает расписание по найденному kadr_id
+    """
+    clean_target = clean_fio(name).strip().lower()
+    parts = clean_target.split()
+    surname = parts[0] if parts else name.strip()
+
+    # Сначала ищем по фамилии
+    prepods = await rusoil.search_prepod(surname if len(surname) >= 2 else name)
+    if not prepods and len(name.strip()) >= 2:
+        prepods = await rusoil.search_prepod(name.strip())
+
     if not prepods:
-        raise HTTPException(status_code=404, detail="Преподаватель не найден")
+        raise HTTPException(status_code=404, detail="Преподаватель не найден в базе УГНТУ")
 
-    first_prepod = prepods[0]
-    kadr_id = first_prepod["id_prepod"]
+    # Ищем наиболее точное совпадение
+    matched = None
+    for p in prepods:
+        pfio = p["fio"].lower()
+        if clean_target in pfio or pfio in clean_target:
+            matched = p
+            break
+        if len(parts) >= 2 and parts[0] in pfio and parts[1] in pfio:
+            matched = p
+            break
 
-    rasp = await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=week)
+    if not matched:
+        matched = prepods[0]
+
+    kadr_id = matched["id_prepod"]
+    cache_key = f"prepod_rasp_{kadr_id}_{week}_{week}"
+    if cache_key in schedule_cache:
+        rasp = schedule_cache[cache_key]
+    else:
+        rasp = await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=week)
+        schedule_cache[cache_key] = rasp
+
     return {
-        "prepod": first_prepod,
+        "prepod": matched,
         "week": week,
         "schedule": rasp,
     }
@@ -211,6 +264,5 @@ if __name__ == "__main__":
     import os
     import uvicorn
 
-    # Поддержка динамического порта для BotHost / PaaS (переменная окружения PORT)
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
