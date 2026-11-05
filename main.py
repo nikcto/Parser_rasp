@@ -55,15 +55,10 @@ async def health():
 
 @app.get("/api/inspect-frontend")
 async def inspect_frontend():
-    """
-    Скачивает главную страницу raspisanie.rusoil.net и JS-бандлы,
-    чтобы найти точные URL API-запросов и формат payload.
-    """
     async with httpx.AsyncClient(base_url=BASE_URL, headers=DEFAULT_HEADERS, timeout=15.0, follow_redirects=True) as client:
         try:
             r = await client.get("/")
             html = r.text
-            # Ищем ссылки на скрипты
             scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
             
             js_findings = []
@@ -72,27 +67,30 @@ async def inspect_frontend():
                 try:
                     js_res = await client.get(script_url)
                     js_code = js_res.text
-                    # Ищем упоминания get_prepod, get_groups, rasp, api, axios, post
-                    matches = re.findall(r'["\'](/?[a-zA-Z0-9_/]*get_[a-zA-Z0-9_]+)["\']', js_code)
-                    # Также ищем вокруг get_prepod контекст (50 символов)
-                    contexts = []
-                    for m in re.finditer(r'get_prepod', js_code):
-                        start = max(0, m.start() - 60)
-                        end = min(len(js_code), m.end() + 100)
-                        contexts.append(js_code[start:end])
+                    
+                    # 1. Находим определение O
+                    # Ищем "var O=", "let O=", "const O=", "O="
+                    o_defs = re.findall(r'(\b[a-zA-Z0-9_$]+\s*=\s*["\'][^"\']*["\'])', js_code[:20000])
+                    # Ищем где создается M() или axios
+                    m_defs = re.findall(r'(\b[a-zA-Z0-9_$]+\.create\([^)]+\))', js_code)
+                    
+                    # Ищем точное место перед M().post(O+"/get_prepod"
+                    idx = js_code.find('"/get_prepod"')
+                    sub_context = js_code[max(0, idx - 500):min(len(js_code), idx + 200)] if idx != -1 else ""
+                    
+                    # Ищем строки похожие на http:// или https:// или порт или домен
+                    urls = re.findall(r'["\'](https?://[^"\']+|/[^"\']+)["\']', js_code)
                     
                     js_findings.append({
                         "url": script_url,
-                        "size": len(js_code),
-                        "endpoints": list(set(matches)),
-                        "contexts": contexts[:3]
+                        "sub_context": sub_context,
+                        "axios_create": m_defs[:5],
+                        "urls_in_code": [u for u in set(urls) if any(k in u for k in ['rusoil', 'api', 'rasp', '80', 'port', 'get_'])]
                     })
                 except Exception as e:
                     js_findings.append({"url": script_url, "error": str(e)})
 
             return {
-                "html_length": len(html),
-                "scripts_found": scripts,
                 "js_analysis": js_findings
             }
         except Exception as e:
