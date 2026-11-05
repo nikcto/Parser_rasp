@@ -1,6 +1,7 @@
 """
 Асинхронный клиент для взаимодействия с официальным API расписания УГНТУ (raspisanie.rusoil.net)
 """
+import json
 import re
 from typing import Any, Dict, List, Optional
 import httpx
@@ -17,7 +18,7 @@ DEFAULT_HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": BASE_URL,
     "Referer": f"{BASE_URL}/",
-    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "keep-alive",
 }
 
 
@@ -50,11 +51,21 @@ class RusoilClient:
             await self._client.aclose()
 
     async def _post_req(self, endpoint: str, payload: Dict[str, Any]) -> Any:
+        """
+        Отправляет POST запрос к raspisanie.rusoil.net.
+        Официальный сайт использует префикс /origins/... и шлёт raw json string
+        с заголовком application/x-www-form-urlencoded
+        """
         client = await self.get_client()
+        raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-        # Попытка 1: JSON payload (формат React/fetch)
+        # 1. Точный формат браузера: raw JSON string с content-type x-www-form-urlencoded
         try:
-            resp = await client.post(endpoint, json=payload)
+            resp = await client.post(
+                endpoint,
+                content=raw_body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
             if resp.status_code == 200:
                 try:
                     data = resp.json()
@@ -65,10 +76,27 @@ class RusoilClient:
         except Exception:
             pass
 
-        # Попытка 2: Form Data payload (формат PHP/jQuery)
+        # 2. Fallback: application/json
         try:
-            form_data = {k: str(v) for k, v in payload.items()}
-            resp = await client.post(endpoint, data=form_data)
+            resp = await client.post(
+                endpoint,
+                content=raw_body,
+                headers={"Content-Type": "application/json"}
+            )
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    if isinstance(data, (dict, list)):
+                        return data
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 3. Fallback: классический form data
+        try:
+            form_dict = {k: str(v) for k, v in payload.items()}
+            resp = await client.post(endpoint, data=form_dict)
             if resp.status_code == 200:
                 try:
                     data = resp.json()
@@ -85,7 +113,7 @@ class RusoilClient:
         """Получает текущую неделю и статус семестра"""
         client = await self.get_client()
         try:
-            resp = await client.post("/get_now?nocache=true", json={})
+            resp = await client.post("/origins/get_now?nocache=true", content=b"{}")
             if resp.status_code == 200:
                 try:
                     return resp.json()
@@ -98,11 +126,11 @@ class RusoilClient:
     async def search_prepod(self, query: str, id_fak: int = 0) -> List[Dict[str, Any]]:
         """
         Поиск преподавателей по фрагменту ФИО
-        POST /get_prepod -> {"id_fak": 0, "search": "по"}
+        POST /origins/get_prepod -> {"id_fak": 0, "search": "дил"}
         """
         if not query or len(query.strip()) < 2:
             return []
-        data = await self._post_req("/get_prepod", {"id_fak": id_fak, "search": query.strip()})
+        data = await self._post_req("/origins/get_prepod", {"id_fak": id_fak, "search": query.strip()})
         if not isinstance(data, dict):
             return []
         prepods = data.get("prepods", [])
@@ -119,11 +147,11 @@ class RusoilClient:
     async def search_groups(self, query: str, id_fak: int = 0) -> List[Dict[str, Any]]:
         """
         Поиск групп по шифру
-        POST /get_groups -> {"id_fak": 0, "search": "БПО"}
+        POST /origins/get_groups -> {"id_fak": 0, "search": "БПО"}
         """
         if not query or len(query.strip()) < 2:
             return []
-        data = await self._post_req("/get_groups", {"id_fak": id_fak, "search": query.strip()})
+        data = await self._post_req("/origins/get_groups", {"id_fak": id_fak, "search": query.strip()})
         if isinstance(data, dict):
             return data.get("groups", [])
         if isinstance(data, list):
@@ -133,11 +161,11 @@ class RusoilClient:
     async def search_auditors(self, query: str) -> List[Dict[str, Any]]:
         """
         Поиск аудиторий
-        POST /get_auditors -> {"search": "432"}
+        POST /origins/get_auditors -> {"search": "432"}
         """
         if not query or len(query.strip()) < 1:
             return []
-        data = await self._post_req("/get_auditors", {"search": query.strip()})
+        data = await self._post_req("/origins/get_auditors", {"search": query.strip()})
         if isinstance(data, dict):
             return data.get("auditors", [])
         if isinstance(data, list):
@@ -147,14 +175,14 @@ class RusoilClient:
     async def get_rasp_prepod(self, kadr_id: int | str, beginweek: int = 10, endweek: int = 10) -> List[Dict[str, Any]]:
         """
         Расписание преподавателя
-        POST /get_rasp_prepod -> {"kadr_id": "25903", "beginweek": 10, "endweek": 10}
+        POST /origins/get_rasp_prepod -> {"kadr_id": "25903", "beginweek": 10, "endweek": 10}
         """
         payload = {
             "kadr_id": str(kadr_id),
             "beginweek": int(beginweek),
             "endweek": int(endweek),
         }
-        data = await self._post_req("/get_rasp_prepod", payload)
+        data = await self._post_req("/origins/get_rasp_prepod", payload)
         if isinstance(data, dict):
             return data.get("rasp", [])
         return []
@@ -166,7 +194,7 @@ class RusoilClient:
             "beginweek": int(beginweek),
             "endweek": int(endweek),
         }
-        data = await self._post_req("/get_rasp_group", payload)
+        data = await self._post_req("/origins/get_rasp_group", payload)
         if isinstance(data, dict):
             return data.get("rasp", [])
         return []
@@ -178,7 +206,7 @@ class RusoilClient:
             "beginweek": int(beginweek),
             "endweek": int(endweek),
         }
-        data = await self._post_req("/get_rasp_auditor", payload)
+        data = await self._post_req("/origins/get_rasp_auditor", payload)
         if isinstance(data, dict):
             return data.get("rasp", [])
         return []

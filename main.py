@@ -2,7 +2,6 @@
 FastAPI прокси-сервер и парсер расписания УГНТУ (raspisanie.rusoil.net)
 """
 import asyncio
-import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from cachetools import TTLCache
@@ -26,7 +25,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="USPTU Schedule API & Proxy",
-    version="1.4.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -44,7 +43,8 @@ async def root():
     return {
         "status": "online",
         "service": "USPTU Schedule Proxy API",
-        "version": "1.4.0",
+        "version": "2.0.0",
+        "upstream": "https://raspisanie.rusoil.net",
     }
 
 
@@ -53,83 +53,28 @@ async def health():
     return {"status": "ok"}
 
 
-@app.get("/api/inspect-frontend")
-async def inspect_frontend():
-    async with httpx.AsyncClient(base_url=BASE_URL, headers=DEFAULT_HEADERS, timeout=15.0, follow_redirects=True) as client:
-        try:
-            r = await client.get("/")
-            html = r.text
-            scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
-            
-            js_findings = []
-            for s in scripts:
-                script_url = s if s.startswith("http") else f"{BASE_URL}/{s.lstrip('./')}"
-                try:
-                    js_res = await client.get(script_url)
-                    js_code = js_res.text
-                    
-                    # 1. Находим определение O
-                    # Ищем "var O=", "let O=", "const O=", "O="
-                    o_defs = re.findall(r'(\b[a-zA-Z0-9_$]+\s*=\s*["\'][^"\']*["\'])', js_code[:20000])
-                    # Ищем где создается M() или axios
-                    m_defs = re.findall(r'(\b[a-zA-Z0-9_$]+\.create\([^)]+\))', js_code)
-                    
-                    # Ищем точное место перед M().post(O+"/get_prepod"
-                    idx = js_code.find('"/get_prepod"')
-                    sub_context = js_code[max(0, idx - 500):min(len(js_code), idx + 200)] if idx != -1 else ""
-                    
-                    # Ищем строки похожие на http:// или https:// или порт или домен
-                    urls = re.findall(r'["\'](https?://[^"\']+|/[^"\']+)["\']', js_code)
-                    
-                    js_findings.append({
-                        "url": script_url,
-                        "sub_context": sub_context,
-                        "axios_create": m_defs[:5],
-                        "urls_in_code": [u for u in set(urls) if any(k in u for k in ['rusoil', 'api', 'rasp', '80', 'port', 'get_'])]
-                    })
-                except Exception as e:
-                    js_findings.append({"url": script_url, "error": str(e)})
-
-            return {
-                "js_analysis": js_findings
-            }
-        except Exception as e:
-            return {"error": str(e)}
-
-
 @app.get("/api/debug")
-async def debug_all(q: str = "дил"):
-    results = {}
-    async with httpx.AsyncClient(base_url=BASE_URL, headers=DEFAULT_HEADERS, timeout=10.0, follow_redirects=True) as client:
-        # Тестируем разные варианты путей
-        endpoints = ["/get_prepod", "get_prepod", "/api/get_prepod", "/get_prepod/"]
-        
-        for ep in endpoints:
-            # 1. JSON
-            try:
-                r = await client.post(ep, json={"id_fak": 0, "search": q})
-                results[f"{ep}_json"] = {
-                    "status": r.status_code,
-                    "ct": r.headers.get("content-type"),
-                    "is_html": "<!doctype" in r.text.lower(),
-                    "preview": r.text[:150]
-                }
-            except Exception as e:
-                results[f"{ep}_json"] = {"error": str(e)}
+async def debug_call(q: str = "дил"):
+    """Тест поиска через официальный эндпоинт /origins/get_prepod"""
+    prepods = await rusoil.search_prepod(q)
+    groups = await rusoil.search_groups(q)
+    return {
+        "query": q,
+        "prepods_found": len(prepods),
+        "prepods": prepods,
+        "groups_found": len(groups),
+        "groups": groups,
+    }
 
-            # 2. Form data
-            try:
-                r = await client.post(ep, data={"id_fak": "0", "search": q})
-                results[f"{ep}_form"] = {
-                    "status": r.status_code,
-                    "ct": r.headers.get("content-type"),
-                    "is_html": "<!doctype" in r.text.lower(),
-                    "preview": r.text[:150]
-                }
-            except Exception as e:
-                results[f"{ep}_form"] = {"error": str(e)}
 
-    return results
+@app.get("/api/now")
+async def get_now_status():
+    cache_key = "now_status"
+    if cache_key in search_cache:
+        return search_cache[cache_key]
+    data = await rusoil.get_now()
+    search_cache[cache_key] = data
+    return data
 
 
 @app.get("/api/search")
@@ -161,6 +106,18 @@ async def global_search(q: str = Query(..., min_length=2)):
 @app.get("/api/prepod/search")
 async def search_prepods(q: str = Query(..., min_length=2)):
     return await rusoil.search_prepod(q.strip())
+
+
+@app.get("/api/groups/search")
+@app.get("/api/group/search")
+async def search_groups(q: str = Query(..., min_length=2)):
+    return await rusoil.search_groups(q.strip())
+
+
+@app.get("/api/auditors/search")
+@app.get("/api/auditor/search")
+async def search_auditors(q: str = Query(..., min_length=1)):
+    return await rusoil.search_auditors(q.strip())
 
 
 @app.get("/api/prepod/by-name")
@@ -196,6 +153,24 @@ async def get_prepod_schedule_by_name(name: str = Query(...), week: int = Query(
         "week": week,
         "schedule": rasp,
     }
+
+
+@app.get("/api/prepod/{kadr_id}/schedule")
+async def get_prepod_schedule(kadr_id: str, week: int = Query(10), end_week: Optional[int] = Query(None)):
+    final_end = end_week if end_week is not None else week
+    return await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=final_end)
+
+
+@app.get("/api/group/{id_group}/schedule")
+async def get_group_schedule(id_group: str, week: int = Query(10), end_week: Optional[int] = Query(None)):
+    final_end = end_week if end_week is not None else week
+    return await rusoil.get_rasp_group(id_group, beginweek=week, endweek=final_end)
+
+
+@app.get("/api/auditor/{id_aud}/schedule")
+async def get_auditor_schedule(id_aud: str, week: int = Query(10), end_week: Optional[int] = Query(None)):
+    final_end = end_week if end_week is not None else week
+    return await rusoil.get_rasp_auditor(id_aud, beginweek=week, endweek=final_end)
 
 
 if __name__ == "__main__":
