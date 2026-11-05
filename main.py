@@ -1,6 +1,5 @@
 """
 FastAPI прокси-сервер и парсер расписания УГНТУ (raspisanie.rusoil.net)
-Разворачивается на российском сервере для обхода геоблокировок Telegram Serverless и внешних клиентов.
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -8,10 +7,10 @@ from typing import Any, Dict, List, Optional
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
-from client import RusoilClient, clean_fio
+from client import RusoilClient, clean_fio, BASE_URL, DEFAULT_HEADERS
 
-# Кэш: результаты поиска храним 1 час, расписание 30 минут
 search_cache = TTLCache(maxsize=1000, ttl=3600)
 schedule_cache = TTLCache(maxsize=500, ttl=1800)
 
@@ -26,12 +25,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="USPTU Schedule API & Proxy",
-    description="Проксирующий REST API для официального расписания УГНТУ (raspisanie.rusoil.net)",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
-# Разрешаем CORS для любых источников (включая Telegram Mini Apps и localhost)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,60 +38,87 @@ app.add_middleware(
 )
 
 
-@app.get("/", tags=["Общее"])
+@app.get("/")
 async def root():
     return {
         "status": "online",
         "service": "USPTU Schedule Proxy API",
-        "version": "1.2.0",
-        "docs": "/docs",
-        "upstream": "https://raspisanie.rusoil.net",
+        "version": "1.3.0",
     }
 
 
-@app.get("/health", tags=["Общее"])
+@app.get("/health")
 async def health():
     return {"status": "ok"}
 
 
-@app.get("/api/debug", tags=["Диагностика"])
-async def debug_test(q: str = "по"):
-    """Тестовый вызов к raspisanie.rusoil.net для проверки ответа официального сервера"""
-    client = await rusoil.get_client()
-    form_data = {"id_fak": "0", "search": q}
-    try:
-        resp = await client.post("/get_prepod", data=form_data)
+@app.get("/api/debug")
+async def debug_all(q: str = "дил"):
+    """
+    Глубокая диагностика взаимодействия с raspisanie.rusoil.net:
+    Тестирует отправку с сессионными cookies, JSON vs Form Data, и возвращает полные логи.
+    """
+    results = {}
+    
+    # Создаем изолированный клиент с поддержкой cookies
+    async with httpx.AsyncClient(base_url=BASE_URL, headers=DEFAULT_HEADERS, timeout=10.0, follow_redirects=True) as client:
+        # 0. Заходим на главную страницу, получаем cookies
         try:
-            parsed = resp.json()
-        except Exception:
-            parsed = None
-        return {
-            "status": resp.status_code,
-            "headers": dict(resp.headers),
-            "parsed_type": type(parsed).__name__,
-            "prepods_count": len(parsed.get("prepods", [])) if isinstance(parsed, dict) else 0,
-            "sample": parsed.get("prepods", [])[:3] if isinstance(parsed, dict) else parsed,
-            "raw_preview": resp.text[:400]
-        }
-    except Exception as e:
-        return {"error": str(e)}
+            r_main = await client.get("/")
+            results["main_status"] = r_main.status_code
+            results["cookies"] = dict(client.cookies)
+        except Exception as e:
+            results["main_error"] = str(e)
+
+        # 1. POST /get_prepod с JSON {"id_fak": 0, "search": q}
+        try:
+            r1 = await client.post("/get_prepod", json={"id_fak": 0, "search": q})
+            results["json_test"] = {
+                "status": r1.status_code,
+                "content_type": r1.headers.get("content-type", ""),
+                "text_preview": r1.text[:300],
+            }
+            try:
+                j = r1.json()
+                results["json_test"]["prepods_count"] = len(j.get("prepods", [])) if isinstance(j, dict) else 0
+                results["json_test"]["sample"] = j.get("prepods", [])[:3] if isinstance(j, dict) else j
+            except Exception as je:
+                results["json_test"]["json_parse_err"] = str(je)
+        except Exception as e:
+            results["json_test"] = {"error": str(e)}
+
+        # 2. POST /get_prepod с Form Data id_fak=0&search=q
+        try:
+            r2 = await client.post("/get_prepod", data={"id_fak": "0", "search": q})
+            results["form_test"] = {
+                "status": r2.status_code,
+                "content_type": r2.headers.get("content-type", ""),
+                "text_preview": r2.text[:300],
+            }
+            try:
+                j = r2.json()
+                results["form_test"]["prepods_count"] = len(j.get("prepods", [])) if isinstance(j, dict) else 0
+                results["form_test"]["sample"] = j.get("prepods", [])[:3] if isinstance(j, dict) else j
+            except Exception as je:
+                results["form_test"]["json_parse_err"] = str(je)
+        except Exception as e:
+            results["form_test"] = {"error": str(e)}
+
+        # 3. POST /get_groups с JSON
+        try:
+            r3 = await client.post("/get_groups", json={"id_fak": 0, "search": q})
+            results["groups_json"] = {
+                "status": r3.status_code,
+                "text_preview": r3.text[:200]
+            }
+        except Exception as e:
+            results["groups_json"] = {"error": str(e)}
+
+    return results
 
 
-@app.get("/api/now", tags=["Общее"], summary="Текущая учебная неделя и статус")
-async def get_now_status():
-    cache_key = "now_status"
-    if cache_key in search_cache:
-        return search_cache[cache_key]
-    data = await rusoil.get_now()
-    search_cache[cache_key] = data
-    return data
-
-
-@app.get("/api/search", tags=["Поиск"], summary="Универсальный поиск (преподаватели, группы, аудитории)")
-async def global_search(
-    q: str = Query(..., min_length=2, description="Поисковый запрос (например: 'Попов', 'БЦШ', '432')")
-):
-    """Параллельно ищет в базе преподавателей, групп и аудиторий"""
+@app.get("/api/search")
+async def global_search(q: str = Query(..., min_length=2)):
     query_clean = q.strip()
     cache_key = f"global_search_{query_clean.lower()}"
     if cache_key in search_cache:
@@ -118,86 +142,25 @@ async def global_search(
     return result
 
 
-@app.get("/api/prepods/search", tags=["Преподаватели"], summary="Поиск преподавателей по ФИО")
-@app.get("/api/prepod/search", tags=["Преподаватели"], include_in_schema=False)
-async def search_prepods(q: str = Query(..., min_length=2, description="ФИО или часть")):
-    query_clean = q.strip()
-    cache_key = f"prepod_search_{query_clean.lower()}"
-    if cache_key in search_cache:
-        return search_cache[cache_key]
-
-    results = await rusoil.search_prepod(query_clean)
-    search_cache[cache_key] = results
-    return results
+@app.get("/api/prepods/search")
+@app.get("/api/prepod/search")
+async def search_prepods(q: str = Query(..., min_length=2)):
+    return await rusoil.search_prepod(q.strip())
 
 
-@app.get("/api/groups/search", tags=["Группы"], summary="Поиск групп по шифру")
-@app.get("/api/group/search", tags=["Группы"], include_in_schema=False)
-async def search_groups(q: str = Query(..., min_length=2, description="Шифр группы (например: БЦШ02)")):
-    query_clean = q.strip()
-    cache_key = f"group_search_{query_clean.lower()}"
-    if cache_key in search_cache:
-        return search_cache[cache_key]
-
-    results = await rusoil.search_groups(query_clean)
-    search_cache[cache_key] = results
-    return results
-
-
-@app.get("/api/auditors/search", tags=["Аудитории"], summary="Поиск аудиторий")
-@app.get("/api/auditor/search", tags=["Аудитории"], include_in_schema=False)
-async def search_auditors(q: str = Query(..., min_length=1, description="Номер аудитории или корпус")):
-    query_clean = q.strip()
-    cache_key = f"auditor_search_{query_clean.lower()}"
-    if cache_key in search_cache:
-        return search_cache[cache_key]
-
-    results = await rusoil.search_auditors(query_clean)
-    search_cache[cache_key] = results
-    return results
-
-
-@app.get("/api/prepod/{kadr_id}/schedule", tags=["Преподаватели"], summary="Расписание преподавателя по ID")
-async def get_prepod_schedule(
-    kadr_id: str,
-    week: int = Query(10, ge=1, le=30, description="Номер учебной недели"),
-    end_week: Optional[int] = Query(None, description="Конечная неделя интервала (по умолчанию равна week)"),
-):
-    final_end_week = end_week if end_week is not None else week
-    cache_key = f"prepod_rasp_{kadr_id}_{week}_{final_end_week}"
-
-    if cache_key in schedule_cache:
-        return schedule_cache[cache_key]
-
-    rasp = await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=final_end_week)
-    schedule_cache[cache_key] = rasp
-    return rasp
-
-
-@app.get("/api/prepod/by-name", tags=["Преподаватели"], summary="Быстрый поиск расписания преподавателя по имени")
-async def get_prepod_schedule_by_name(
-    name: str = Query(..., description="ФИО преподавателя (например: 'Попов Денис Владимирович')"),
-    week: int = Query(10, ge=1, le=30, description="Номер недели"),
-):
-    """
-    Умный поиск расписания преподавателя:
-    1. Ищет по фамилии (первое слово) на официальном сервере
-    2. Сопоставляет полное ФИО независимо от точек и опечаток
-    3. Загружает расписание по найденному kadr_id
-    """
+@app.get("/api/prepod/by-name")
+async def get_prepod_schedule_by_name(name: str = Query(...), week: int = Query(10)):
     clean_target = clean_fio(name).strip().lower()
     parts = clean_target.split()
     surname = parts[0] if parts else name.strip()
 
-    # Сначала ищем по фамилии
     prepods = await rusoil.search_prepod(surname if len(surname) >= 2 else name)
     if not prepods and len(name.strip()) >= 2:
         prepods = await rusoil.search_prepod(name.strip())
 
     if not prepods:
-        raise HTTPException(status_code=404, detail="Преподаватель не найден в базе УГНТУ")
+        raise HTTPException(status_code=404, detail="Преподаватель не найден")
 
-    # Ищем наиболее точное совпадение
     matched = None
     for p in prepods:
         pfio = p["fio"].lower()
@@ -212,13 +175,7 @@ async def get_prepod_schedule_by_name(
         matched = prepods[0]
 
     kadr_id = matched["id_prepod"]
-    cache_key = f"prepod_rasp_{kadr_id}_{week}_{week}"
-    if cache_key in schedule_cache:
-        rasp = schedule_cache[cache_key]
-    else:
-        rasp = await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=week)
-        schedule_cache[cache_key] = rasp
-
+    rasp = await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=week)
     return {
         "prepod": matched,
         "week": week,
@@ -226,43 +183,14 @@ async def get_prepod_schedule_by_name(
     }
 
 
-@app.get("/api/group/{id_group}/schedule", tags=["Группы"], summary="Расписание группы по ID")
-async def get_group_schedule(
-    id_group: str,
-    week: int = Query(10, ge=1, le=30, description="Номер учебной недели"),
-    end_week: Optional[int] = Query(None, description="Конечная неделя"),
-):
-    final_end_week = end_week if end_week is not None else week
-    cache_key = f"group_rasp_{id_group}_{week}_{final_end_week}"
-
-    if cache_key in schedule_cache:
-        return schedule_cache[cache_key]
-
-    rasp = await rusoil.get_rasp_group(id_group, beginweek=week, endweek=final_end_week)
-    schedule_cache[cache_key] = rasp
-    return rasp
-
-
-@app.get("/api/auditor/{id_aud}/schedule", tags=["Аудитории"], summary="Расписание аудитории по ID")
-async def get_auditor_schedule(
-    id_aud: str,
-    week: int = Query(10, ge=1, le=30, description="Номер учебной недели"),
-    end_week: Optional[int] = Query(None, description="Конечная неделя"),
-):
-    final_end_week = end_week if end_week is not None else week
-    cache_key = f"aud_rasp_{id_aud}_{week}_{final_end_week}"
-
-    if cache_key in schedule_cache:
-        return schedule_cache[cache_key]
-
-    rasp = await rusoil.get_rasp_auditor(id_aud, beginweek=week, endweek=final_end_week)
-    schedule_cache[cache_key] = rasp
-    return rasp
+@app.get("/api/prepod/{kadr_id}/schedule")
+async def get_prepod_schedule(kadr_id: str, week: int = Query(10), end_week: Optional[int] = Query(None)):
+    final_end = end_week if end_week is not None else week
+    return await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=final_end)
 
 
 if __name__ == "__main__":
     import os
     import uvicorn
-
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
