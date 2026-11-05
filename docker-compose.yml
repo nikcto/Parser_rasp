@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  rusoil-parser:
+    build: .
+    container_name: rusoil_schedule_api
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Yekaterinburg
