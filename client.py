@@ -7,14 +7,13 @@ import httpx
 
 BASE_URL = "https://raspisanie.rusoil.net"
 
-# Заголовки, точно имитирующие реальный браузер и AJAX запросы jQuery с сайта raspisanie.rusoil.net
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     "Origin": BASE_URL,
     "Referer": f"{BASE_URL}/",
@@ -51,19 +50,11 @@ class RusoilClient:
             await self._client.aclose()
 
     async def _post_req(self, endpoint: str, payload: Dict[str, Any]) -> Any:
-        """
-        Отправляет POST запрос к raspisanie.rusoil.net.
-        Сервер университета работает на PHP, поэтому первоочередной формат -
-        application/x-www-form-urlencoded (data=form_data), так как именно его
-        ожидает PHP $_POST при запросах jQuery.
-        В случае неудачи предусмотрен fallback на application/json.
-        """
         client = await self.get_client()
-        form_data = {k: str(v) for k, v in payload.items()}
-        
-        # Попытка 1: Form-urlencoded (стандарт jQuery / PHP)
+
+        # Попытка 1: JSON payload (формат React/fetch)
         try:
-            resp = await client.post(endpoint, data=form_data)
+            resp = await client.post(endpoint, json=payload)
             if resp.status_code == 200:
                 try:
                     data = resp.json()
@@ -74,9 +65,10 @@ class RusoilClient:
         except Exception:
             pass
 
-        # Попытка 2: JSON payload
+        # Попытка 2: Form Data payload (формат PHP/jQuery)
         try:
-            resp = await client.post(endpoint, json=payload)
+            form_data = {k: str(v) for k, v in payload.items()}
+            resp = await client.post(endpoint, data=form_data)
             if resp.status_code == 200:
                 try:
                     data = resp.json()
@@ -93,7 +85,7 @@ class RusoilClient:
         """Получает текущую неделю и статус семестра"""
         client = await self.get_client()
         try:
-            resp = await client.post("/get_now?nocache=true", data={})
+            resp = await client.post("/get_now?nocache=true", json={})
             if resp.status_code == 200:
                 try:
                     return resp.json()
@@ -106,7 +98,7 @@ class RusoilClient:
     async def search_prepod(self, query: str, id_fak: int = 0) -> List[Dict[str, Any]]:
         """
         Поиск преподавателей по фрагменту ФИО
-        POST /get_prepod -> id_fak=0, search="по"
+        POST /get_prepod -> {"id_fak": 0, "search": "по"}
         """
         if not query or len(query.strip()) < 2:
             return []
@@ -127,7 +119,7 @@ class RusoilClient:
     async def search_groups(self, query: str, id_fak: int = 0) -> List[Dict[str, Any]]:
         """
         Поиск групп по шифру
-        POST /get_groups -> id_fak=0, search="БПО"
+        POST /get_groups -> {"id_fak": 0, "search": "БПО"}
         """
         if not query or len(query.strip()) < 2:
             return []
@@ -141,7 +133,7 @@ class RusoilClient:
     async def search_auditors(self, query: str) -> List[Dict[str, Any]]:
         """
         Поиск аудиторий
-        POST /get_auditors -> search="432"
+        POST /get_auditors -> {"search": "432"}
         """
         if not query or len(query.strip()) < 1:
             return []
@@ -155,7 +147,7 @@ class RusoilClient:
     async def get_rasp_prepod(self, kadr_id: int | str, beginweek: int = 10, endweek: int = 10) -> List[Dict[str, Any]]:
         """
         Расписание преподавателя
-        POST /get_rasp_prepod -> kadr_id="25903", beginweek=10, endweek=10
+        POST /get_rasp_prepod -> {"kadr_id": "25903", "beginweek": 10, "endweek": 10}
         """
         payload = {
             "kadr_id": str(kadr_id),
