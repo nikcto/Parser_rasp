@@ -2,6 +2,7 @@
 FastAPI прокси-сервер и парсер расписания УГНТУ (raspisanie.rusoil.net)
 """
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from cachetools import TTLCache
@@ -25,7 +26,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="USPTU Schedule API & Proxy",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -43,7 +44,7 @@ async def root():
     return {
         "status": "online",
         "service": "USPTU Schedule Proxy API",
-        "version": "1.3.0",
+        "version": "1.4.0",
     }
 
 
@@ -52,67 +53,83 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/api/inspect-frontend")
+async def inspect_frontend():
+    """
+    Скачивает главную страницу raspisanie.rusoil.net и JS-бандлы,
+    чтобы найти точные URL API-запросов и формат payload.
+    """
+    async with httpx.AsyncClient(base_url=BASE_URL, headers=DEFAULT_HEADERS, timeout=15.0, follow_redirects=True) as client:
+        try:
+            r = await client.get("/")
+            html = r.text
+            # Ищем ссылки на скрипты
+            scripts = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html)
+            
+            js_findings = []
+            for s in scripts:
+                script_url = s if s.startswith("http") else f"{BASE_URL}/{s.lstrip('./')}"
+                try:
+                    js_res = await client.get(script_url)
+                    js_code = js_res.text
+                    # Ищем упоминания get_prepod, get_groups, rasp, api, axios, post
+                    matches = re.findall(r'["\'](/?[a-zA-Z0-9_/]*get_[a-zA-Z0-9_]+)["\']', js_code)
+                    # Также ищем вокруг get_prepod контекст (50 символов)
+                    contexts = []
+                    for m in re.finditer(r'get_prepod', js_code):
+                        start = max(0, m.start() - 60)
+                        end = min(len(js_code), m.end() + 100)
+                        contexts.append(js_code[start:end])
+                    
+                    js_findings.append({
+                        "url": script_url,
+                        "size": len(js_code),
+                        "endpoints": list(set(matches)),
+                        "contexts": contexts[:3]
+                    })
+                except Exception as e:
+                    js_findings.append({"url": script_url, "error": str(e)})
+
+            return {
+                "html_length": len(html),
+                "scripts_found": scripts,
+                "js_analysis": js_findings
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
 @app.get("/api/debug")
 async def debug_all(q: str = "дил"):
-    """
-    Глубокая диагностика взаимодействия с raspisanie.rusoil.net:
-    Тестирует отправку с сессионными cookies, JSON vs Form Data, и возвращает полные логи.
-    """
     results = {}
-    
-    # Создаем изолированный клиент с поддержкой cookies
     async with httpx.AsyncClient(base_url=BASE_URL, headers=DEFAULT_HEADERS, timeout=10.0, follow_redirects=True) as client:
-        # 0. Заходим на главную страницу, получаем cookies
-        try:
-            r_main = await client.get("/")
-            results["main_status"] = r_main.status_code
-            results["cookies"] = dict(client.cookies)
-        except Exception as e:
-            results["main_error"] = str(e)
-
-        # 1. POST /get_prepod с JSON {"id_fak": 0, "search": q}
-        try:
-            r1 = await client.post("/get_prepod", json={"id_fak": 0, "search": q})
-            results["json_test"] = {
-                "status": r1.status_code,
-                "content_type": r1.headers.get("content-type", ""),
-                "text_preview": r1.text[:300],
-            }
+        # Тестируем разные варианты путей
+        endpoints = ["/get_prepod", "get_prepod", "/api/get_prepod", "/get_prepod/"]
+        
+        for ep in endpoints:
+            # 1. JSON
             try:
-                j = r1.json()
-                results["json_test"]["prepods_count"] = len(j.get("prepods", [])) if isinstance(j, dict) else 0
-                results["json_test"]["sample"] = j.get("prepods", [])[:3] if isinstance(j, dict) else j
-            except Exception as je:
-                results["json_test"]["json_parse_err"] = str(je)
-        except Exception as e:
-            results["json_test"] = {"error": str(e)}
+                r = await client.post(ep, json={"id_fak": 0, "search": q})
+                results[f"{ep}_json"] = {
+                    "status": r.status_code,
+                    "ct": r.headers.get("content-type"),
+                    "is_html": "<!doctype" in r.text.lower(),
+                    "preview": r.text[:150]
+                }
+            except Exception as e:
+                results[f"{ep}_json"] = {"error": str(e)}
 
-        # 2. POST /get_prepod с Form Data id_fak=0&search=q
-        try:
-            r2 = await client.post("/get_prepod", data={"id_fak": "0", "search": q})
-            results["form_test"] = {
-                "status": r2.status_code,
-                "content_type": r2.headers.get("content-type", ""),
-                "text_preview": r2.text[:300],
-            }
+            # 2. Form data
             try:
-                j = r2.json()
-                results["form_test"]["prepods_count"] = len(j.get("prepods", [])) if isinstance(j, dict) else 0
-                results["form_test"]["sample"] = j.get("prepods", [])[:3] if isinstance(j, dict) else j
-            except Exception as je:
-                results["form_test"]["json_parse_err"] = str(je)
-        except Exception as e:
-            results["form_test"] = {"error": str(e)}
-
-        # 3. POST /get_groups с JSON
-        try:
-            r3 = await client.post("/get_groups", json={"id_fak": 0, "search": q})
-            results["groups_json"] = {
-                "status": r3.status_code,
-                "text_preview": r3.text[:200]
-            }
-        except Exception as e:
-            results["groups_json"] = {"error": str(e)}
+                r = await client.post(ep, data={"id_fak": "0", "search": q})
+                results[f"{ep}_form"] = {
+                    "status": r.status_code,
+                    "ct": r.headers.get("content-type"),
+                    "is_html": "<!doctype" in r.text.lower(),
+                    "preview": r.text[:150]
+                }
+            except Exception as e:
+                results[f"{ep}_form"] = {"error": str(e)}
 
     return results
 
@@ -181,12 +198,6 @@ async def get_prepod_schedule_by_name(name: str = Query(...), week: int = Query(
         "week": week,
         "schedule": rasp,
     }
-
-
-@app.get("/api/prepod/{kadr_id}/schedule")
-async def get_prepod_schedule(kadr_id: str, week: int = Query(10), end_week: Optional[int] = Query(None)):
-    final_end = end_week if end_week is not None else week
-    return await rusoil.get_rasp_prepod(kadr_id, beginweek=week, endweek=final_end)
 
 
 if __name__ == "__main__":
